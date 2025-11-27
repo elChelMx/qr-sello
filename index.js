@@ -1,20 +1,20 @@
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
 const app = express();
 
-// Render te pasa el puerto en process.env.PORT
+// Puerto que Render asigna
 const PORT = process.env.PORT || 3000;
 
-// Respeta X-Forwarded-For detrás de proxy
+// Respetar IP real detrás de proxy (Render + Cloudflare)
 app.set('trust proxy', true);
 
 // Para leer JSON (fingerprint)
 app.use(express.json());
 
-// === Inicializar base de datos SQLite ===
+// ==== Base de datos SQLite ====
 const dbPath = path.join(__dirname, 'scanlogs.db');
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
@@ -39,30 +39,18 @@ db.serialize(() => {
   `);
 });
 
-// === Configuración de SMTP para enviar correo ===
-// Para Outlook/Hotmail se suele usar smtp-mail.outlook.com puerto 587 con STARTTLS 
-const smtpHost = process.env.SMTP_HOST || 'smtp-mail.outlook.com';
-const smtpPort = parseInt(process.env.SMTP_PORT || '587', 10);
-const smtpUser = process.env.SMTP_USER;
-const smtpPass = process.env.SMTP_PASS;
+// ==== Resend (emails por API HTTP) ====
+const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
+let resend = null;
 
-let mailer = null;
-
-if (smtpUser && smtpPass) {
-  mailer = nodemailer.createTransport({
-    host: smtpHost,
-    port: smtpPort,
-    secure: false, // TLS explícito en 587
-    auth: {
-      user: smtpUser,
-      pass: smtpPass
-    }
-  });
+if (!RESEND_API_KEY) {
+  console.warn('RESEND_API_KEY no definida; no se enviarán correos de aviso.');
 } else {
-  console.warn('SMTP_USER o SMTP_PASS no definidos; no se enviarán correos de aviso.');
+  resend = new Resend(RESEND_API_KEY);
+  console.log('Resend inicializado.');
 }
 
-// Función para registrar un escaneo
+// Guarda un registro en la BD
 function logScan({ createdAt, ip, ipRaw, xff, headers, userAgent, fpData }) {
   const stmt = db.prepare(`
     INSERT INTO scan_logs
@@ -83,49 +71,54 @@ function logScan({ createdAt, ip, ipRaw, xff, headers, userAgent, fpData }) {
   stmt.finalize();
 }
 
-// Enviar correo de notificación
-function sendNotificationEmail({ createdAt, ip, userAgent }) {
-  if (!mailer) {
-    console.warn('Mailer no configurado; se omite envío de correo.');
+// Envía correo "SOBRE ABIERTO" usando Resend
+async function sendNotificationEmail({ createdAt, ip, userAgent }) {
+  if (!resend) {
+    console.warn('Resend no inicializado; se omite envío de correo.');
     return;
   }
 
-  const to = process.env.EMAIL_TO || smtpUser;
-  const from = process.env.EMAIL_FROM || smtpUser;
+  const to = process.env.EMAIL_TO || process.env.EMAIL_FROM;
+  const from = process.env.EMAIL_FROM || 'onboarding@resend.dev';
 
-  const text = [
-    'Se ha detectado un escaneo del código de seguridad.',
-    '',
-    `Fecha/hora (UTC): ${createdAt}`,
-    `IP: ${ip || 'desconocida'}`,
-    `User-Agent: ${userAgent || ''}`,
-    '',
-    'Puedes consultar el detalle completo en /admin/logs o descargar /admin/logs.csv.'
-  ].join('\n');
+  if (!to) {
+    console.warn('EMAIL_TO no definido; se omite envío de correo.');
+    return;
+  }
 
-  mailer.sendMail(
-    {
+  try {
+    const { data, error } = await resend.emails.send({
       from,
       to,
       subject: 'SOBRE ABIERTO',
-      text
-    },
-    (err, info) => {
-      if (err) {
-        console.error('Error enviando correo de aviso:', err);
-      } else {
-        console.log('Correo de aviso enviado:', info && info.messageId);
-      }
+      text: [
+        'Se ha detectado un escaneo del código de seguridad.',
+        '',
+        `Fecha/hora (UTC): ${createdAt}`,
+        `IP: ${ip || 'desconocida'}`,
+        `User-Agent: ${userAgent || ''}`,
+        '',
+        'Puedes consultar el detalle completo en /admin/logs o descargar /admin/logs.csv.'
+      ].join('\n')
+    });
+
+    if (error) {
+      console.error('Error Resend:', error);
+    } else {
+      console.log('Correo de aviso enviado vía Resend:', data && data.id);
     }
-  );
+  } catch (err) {
+    console.error('Error enviando correo vía Resend:', err);
+  }
 }
 
-// Ruta básica para comprobar que el servidor responde
+// ==== Rutas ====
+
 app.get('/', (req, res) => {
   res.send('Servidor activo. Usa /scan para registrar un escaneo.');
 });
 
-// === URL que irá en el QR ===
+// URL para el QR
 app.get('/scan', (req, res) => {
   const createdAt = new Date().toISOString();
   const ip = req.ip;
@@ -133,7 +126,7 @@ app.get('/scan', (req, res) => {
   const xff = req.headers['x-forwarded-for'] || null;
   const userAgent = req.headers['user-agent'] || '';
 
-  // Registro servidor (IP + headers)
+  // Guardar registro básico
   logScan({
     createdAt,
     ip,
@@ -144,7 +137,7 @@ app.get('/scan', (req, res) => {
     fpData: null
   });
 
-  // Enviar correo de aviso
+  // Disparar correo (no esperamos la respuesta)
   sendNotificationEmail({ createdAt, ip, userAgent });
 
   // Página que ve quien escanea
@@ -162,7 +155,6 @@ app.get('/scan', (req, res) => {
 
   <script>
     (function() {
-      // Fingerprint sencillo del navegador
       var fp = {
         userAgent: navigator.userAgent,
         language: navigator.language,
@@ -192,7 +184,7 @@ app.get('/scan', (req, res) => {
 </html>`);
 });
 
-// === Endpoint que recibe el fingerprint ===
+// Fingerprint extra
 app.post('/scan/fp', (req, res) => {
   const createdAt = new Date().toISOString();
   const ip = req.ip;
@@ -211,10 +203,10 @@ app.post('/scan/fp', (req, res) => {
     fpData: fpPayload
   });
 
-  res.status(204).end(); // sin contenido
+  res.status(204).end();
 });
 
-// === Ver los últimos registros (para ti) ===
+// Ver logs JSON
 app.get('/admin/logs', (req, res) => {
   db.all('SELECT * FROM scan_logs ORDER BY id DESC LIMIT 100', (err, rows) => {
     if (err) {
@@ -225,7 +217,7 @@ app.get('/admin/logs', (req, res) => {
   });
 });
 
-// === Descargar registros en CSV ===
+// Descargar CSV
 app.get('/admin/logs.csv', (req, res) => {
   db.all('SELECT * FROM scan_logs ORDER BY id DESC', (err, rows) => {
     if (err) {
@@ -236,7 +228,7 @@ app.get('/admin/logs.csv', (req, res) => {
     function csvEscape(value) {
       if (value === null || value === undefined) return '""';
       const str = String(value).replace(/"/g, '""');
-      return `"${str}"`;
+      return '"' + str + '"';
     }
 
     const header = [
