@@ -1,12 +1,14 @@
 {
-  "name": "qr-scan-logger",
+  "name": "qr-sello",
   "version": "1.0.0",
+  "description": "Registro de escaneos de QR para sello de seguridad",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.0",
-    "sqlite3": "^5.1.7"
+    "express": "^4.19.2",
+    "sqlite3": "^5.1.7",
+    "nodemailer": "^6.9.15"
   }
 }
