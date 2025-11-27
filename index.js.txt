@@ -1,0 +1,149 @@
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Para que respete X-Forwarded-For cuando esté detrás de proxy
+app.set('trust proxy', true);
+
+// Para poder leer JSON en el body (fingerprint)
+app.use(express.json());
+
+// === Inicializar base de datos SQLite ===
+const dbPath = path.join(__dirname, 'scanlogs.db');
+const db = new sqlite3.Database(dbPath);
+
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS scan_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      ip TEXT,
+      ip_raw TEXT,
+      x_forwarded_for TEXT,
+      headers TEXT,
+      user_agent TEXT,
+      fp_data TEXT
+    )
+  `);
+});
+
+// Función para registrar un escaneo
+function logScan({ ip, ipRaw, xff, headers, userAgent, fpData }) {
+  const stmt = db.prepare(`
+    INSERT INTO scan_logs
+      (created_at, ip, ip_raw, x_forwarded_for, headers, user_agent, fp_data)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  stmt.run(
+    new Date().toISOString(),
+    ip || null,
+    ipRaw || null,
+    xff || null,
+    JSON.stringify(headers || {}),
+    userAgent || '',
+    fpData ? JSON.stringify(fpData) : null
+  );
+
+  stmt.finalize();
+}
+
+// === URL que irá en el QR ===
+app.get('/scan', (req, res) => {
+  const ip = req.ip;
+  const ipRaw = req.socket.remoteAddress;
+  const xff = req.headers['x-forwarded-for'] || null;
+  const userAgent = req.headers['user-agent'] || '';
+
+  // Registro servidor (IP + headers)
+  logScan({
+    ip,
+    ipRaw,
+    xff,
+    headers: req.headers,
+    userAgent,
+    fpData: null
+  });
+
+  // Página que ve quien escanea
+  res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Verificación registrada</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body style="font-family: system-ui, sans-serif; padding: 1.5rem;">
+  <h1>Verificación registrada</h1>
+  <p>El código ha sido leído correctamente.</p>
+  <p>Puede cerrar esta página.</p>
+
+  <script>
+    (function() {
+      // Fingerprint sencillo del navegador
+      var fp = {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        languages: navigator.languages,
+        platform: navigator.platform,
+        screen: {
+          width: window.screen && window.screen.width,
+          height: window.screen && window.screen.height
+        },
+        window: {
+          innerWidth: window.innerWidth,
+          innerHeight: window.innerHeight
+        },
+        timezone: (Intl && Intl.DateTimeFormat && Intl.DateTimeFormat().resolvedOptions().timeZone) || null
+      };
+
+      fetch('/scan/fp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fp)
+      }).catch(function(err) {
+        console.error('Error enviando fingerprint', err);
+      });
+    })();
+  </script>
+</body>
+</html>`);
+});
+
+// === Endpoint que recibe el fingerprint ===
+app.post('/scan/fp', (req, res) => {
+  const ip = req.ip;
+  const ipRaw = req.socket.remoteAddress;
+  const xff = req.headers['x-forwarded-for'] || null;
+  const userAgent = req.headers['user-agent'] || '';
+  const fpPayload = req.body || null;
+
+  logScan({
+    ip,
+    ipRaw,
+    xff,
+    headers: req.headers,
+    userAgent,
+    fpData: fpPayload
+  });
+
+  res.status(204).end(); // sin contenido
+});
+
+// === Ver los últimos registros (para ti) ===
+app.get('/admin/logs', (req, res) => {
+  db.all('SELECT * FROM scan_logs ORDER BY id DESC LIMIT 100', (err, rows) => {
+    if (err) {
+      console.error('Error al consultar la base de datos', err);
+      return res.status(500).send('Error consultando la base de datos');
+    }
+    res.json(rows);
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Servidor escuchando en puerto ${PORT}`);
+});
