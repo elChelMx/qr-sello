@@ -3,17 +3,25 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
 const app = express();
+
+// Render te pasa el puerto en process.env.PORT
 const PORT = process.env.PORT || 3000;
 
-// Para que respete X-Forwarded-For cuando esté detrás de proxy
+// Respeta X-Forwarded-For detrás de proxy
 app.set('trust proxy', true);
 
-// Para poder leer JSON en el body (fingerprint)
+// Para leer JSON (fingerprint)
 app.use(express.json());
 
 // === Inicializar base de datos SQLite ===
 const dbPath = path.join(__dirname, 'scanlogs.db');
-const db = new sqlite3.Database(dbPath);
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) {
+    console.error('Error abriendo la BD SQLite:', err);
+  } else {
+    console.log('BD SQLite abierta en:', dbPath);
+  }
+});
 
 db.serialize(() => {
   db.run(`
@@ -50,6 +58,11 @@ function logScan({ ip, ipRaw, xff, headers, userAgent, fpData }) {
 
   stmt.finalize();
 }
+
+// Ruta básica para comprobar que el servidor responde
+app.get('/', (req, res) => {
+  res.send('Servidor activo. Usa /scan para registrar un escaneo.');
+});
 
 // === URL que irá en el QR ===
 app.get('/scan', (req, res) => {
@@ -145,6 +158,5 @@ app.get('/admin/logs', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor escuchando en puerto ${PORT}`);
+  console.log('Servidor escuchando en puerto ' + PORT);
 });
-
