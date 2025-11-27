@@ -1,6 +1,7 @@
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const nodemailer = require('nodemailer');
 
 const app = express();
 
@@ -38,8 +39,31 @@ db.serialize(() => {
   `);
 });
 
+// === Configuración de SMTP para enviar correo ===
+// Para Outlook/Hotmail se suele usar smtp-mail.outlook.com puerto 587 con STARTTLS 
+const smtpHost = process.env.SMTP_HOST || 'smtp-mail.outlook.com';
+const smtpPort = parseInt(process.env.SMTP_PORT || '587', 10);
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS;
+
+let mailer = null;
+
+if (smtpUser && smtpPass) {
+  mailer = nodemailer.createTransport({
+    host: smtpHost,
+    port: smtpPort,
+    secure: false, // TLS explícito en 587
+    auth: {
+      user: smtpUser,
+      pass: smtpPass
+    }
+  });
+} else {
+  console.warn('SMTP_USER o SMTP_PASS no definidos; no se enviarán correos de aviso.');
+}
+
 // Función para registrar un escaneo
-function logScan({ ip, ipRaw, xff, headers, userAgent, fpData }) {
+function logScan({ createdAt, ip, ipRaw, xff, headers, userAgent, fpData }) {
   const stmt = db.prepare(`
     INSERT INTO scan_logs
       (created_at, ip, ip_raw, x_forwarded_for, headers, user_agent, fp_data)
@@ -47,7 +71,7 @@ function logScan({ ip, ipRaw, xff, headers, userAgent, fpData }) {
   `);
 
   stmt.run(
-    new Date().toISOString(),
+    createdAt || new Date().toISOString(),
     ip || null,
     ipRaw || null,
     xff || null,
@@ -59,6 +83,43 @@ function logScan({ ip, ipRaw, xff, headers, userAgent, fpData }) {
   stmt.finalize();
 }
 
+// Enviar correo de notificación
+function sendNotificationEmail({ createdAt, ip, userAgent }) {
+  if (!mailer) {
+    console.warn('Mailer no configurado; se omite envío de correo.');
+    return;
+  }
+
+  const to = process.env.EMAIL_TO || smtpUser;
+  const from = process.env.EMAIL_FROM || smtpUser;
+
+  const text = [
+    'Se ha detectado un escaneo del código de seguridad.',
+    '',
+    `Fecha/hora (UTC): ${createdAt}`,
+    `IP: ${ip || 'desconocida'}`,
+    `User-Agent: ${userAgent || ''}`,
+    '',
+    'Puedes consultar el detalle completo en /admin/logs o descargar /admin/logs.csv.'
+  ].join('\n');
+
+  mailer.sendMail(
+    {
+      from,
+      to,
+      subject: 'SOBRE ABIERTO',
+      text
+    },
+    (err, info) => {
+      if (err) {
+        console.error('Error enviando correo de aviso:', err);
+      } else {
+        console.log('Correo de aviso enviado:', info && info.messageId);
+      }
+    }
+  );
+}
+
 // Ruta básica para comprobar que el servidor responde
 app.get('/', (req, res) => {
   res.send('Servidor activo. Usa /scan para registrar un escaneo.');
@@ -66,6 +127,7 @@ app.get('/', (req, res) => {
 
 // === URL que irá en el QR ===
 app.get('/scan', (req, res) => {
+  const createdAt = new Date().toISOString();
   const ip = req.ip;
   const ipRaw = req.socket.remoteAddress;
   const xff = req.headers['x-forwarded-for'] || null;
@@ -73,6 +135,7 @@ app.get('/scan', (req, res) => {
 
   // Registro servidor (IP + headers)
   logScan({
+    createdAt,
     ip,
     ipRaw,
     xff,
@@ -80,6 +143,9 @@ app.get('/scan', (req, res) => {
     userAgent,
     fpData: null
   });
+
+  // Enviar correo de aviso
+  sendNotificationEmail({ createdAt, ip, userAgent });
 
   // Página que ve quien escanea
   res.send(`<!DOCTYPE html>
@@ -128,6 +194,7 @@ app.get('/scan', (req, res) => {
 
 // === Endpoint que recibe el fingerprint ===
 app.post('/scan/fp', (req, res) => {
+  const createdAt = new Date().toISOString();
   const ip = req.ip;
   const ipRaw = req.socket.remoteAddress;
   const xff = req.headers['x-forwarded-for'] || null;
@@ -135,6 +202,7 @@ app.post('/scan/fp', (req, res) => {
   const fpPayload = req.body || null;
 
   logScan({
+    createdAt,
     ip,
     ipRaw,
     xff,
@@ -154,6 +222,50 @@ app.get('/admin/logs', (req, res) => {
       return res.status(500).send('Error consultando la base de datos');
     }
     res.json(rows);
+  });
+});
+
+// === Descargar registros en CSV ===
+app.get('/admin/logs.csv', (req, res) => {
+  db.all('SELECT * FROM scan_logs ORDER BY id DESC', (err, rows) => {
+    if (err) {
+      console.error('Error al consultar la base de datos', err);
+      return res.status(500).send('Error consultando la base de datos');
+    }
+
+    function csvEscape(value) {
+      if (value === null || value === undefined) return '""';
+      const str = String(value).replace(/"/g, '""');
+      return `"${str}"`;
+    }
+
+    const header = [
+      'id',
+      'created_at',
+      'ip',
+      'ip_raw',
+      'x_forwarded_for',
+      'user_agent',
+      'fp_data'
+    ].join(',') + '\\n';
+
+    const lines = rows.map(row => {
+      return [
+        csvEscape(row.id),
+        csvEscape(row.created_at),
+        csvEscape(row.ip),
+        csvEscape(row.ip_raw),
+        csvEscape(row.x_forwarded_for),
+        csvEscape(row.user_agent),
+        csvEscape(row.fp_data)
+      ].join(',');
+    });
+
+    const csv = header + lines.join('\\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="scan_logs.csv"');
+    res.send(csv);
   });
 });
 
