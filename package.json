@@ -9,6 +9,6 @@
   "dependencies": {
     "express": "^4.19.2",
     "sqlite3": "^5.1.7",
-    "nodemailer": "^6.9.15"
+    "resend": "^4.0.0"
   }
 }
